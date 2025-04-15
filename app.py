@@ -125,7 +125,7 @@ uploaded_file = st.file_uploader("Escolha uma imagem", type=["jpg", "jpeg", "png
 
 modo = st.selectbox("Modo de leitura", ["Automático (Contornos)", "OCR (Reconhecimento de Texto)"])
 
-num_questions = st.slider("Número de questões", 1, 20, 10)
+num_questions = st.slider("Número de questões", 1, 50, 10)
 num_options = st.slider("Número de alternativas por questão", 2, 5, 4)
 gabarito = st.text_input("Gabarito (ex: abcdabcdab)", max_chars=num_questions).lower()
 
