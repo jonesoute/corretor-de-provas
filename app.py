@@ -1,47 +1,67 @@
 import streamlit as st
-import numpy as np
 import cv2
-import easyocr
+import numpy as np
 from PIL import Image
+import tempfile
+import easyocr
 
-st.set_page_config(page_title="Leitor de Gabarito", layout="centered")
+# ------------------ CONFIGURAÇÕES GERAIS ------------------
+st.set_page_config(page_title="Corretor de Provas", layout="centered")
+st.title("📄 Corretor Automático de Provas")
+st.markdown("Envie uma imagem da folha de respostas preenchida para correção.")
+st.warning("**Atenção!** Tire a foto com o **celular na horizontal** para melhor leitura da imagem.")
 
-# ---------- Funções ----------
+# ------------------ ENTRADAS DO USUÁRIO ------------------
+usar_perspectiva = st.checkbox("Aplicar correção de perspectiva", value=True)
 
+modo = st.selectbox("Modo de leitura da prova:", ["Automático (Contornos)", "Modelo Base (Template)"])
+num_questions = st.number_input("Número de questões:", min_value=1, max_value=50, value=26)
+num_options = st.number_input("Número de alternativas (A, B, C...):", min_value=2, max_value=5, value=4)
+
+gabarito_str = st.text_input("Gabarito (ex: a,b,c,d,...):")
+gabarito = [alt.strip().lower() for alt in gabarito_str.split(',') if alt.strip()]
+
+uploaded_file = st.file_uploader("Envie a imagem da prova:", type=["jpg", "jpeg", "png"])
+
+# ------------------ PRÉ-PROCESSAMENTO ------------------
 def preprocess_image(img):
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     return thresh
 
+# ------------------ CORREÇÃO DE PERSPECTIVA ------------------
 def corrige_perspectiva(img):
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 75, 200)
+    edged = cv2.Canny(blur, 50, 150)
 
-    contours, _ = cv2.findContours(edges.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
 
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+
         if len(approx) == 4:
-            doc_cnts = approx
+            pts = approx.reshape(4, 2)
             break
     else:
-        return img  # se não encontrar contorno de 4 lados, retorna a imagem original
+        return img  # Retorna imagem original se falhar
 
-    pts = doc_cnts.reshape(4, 2)
-    rect = np.zeros((4, 2), dtype="float32")
+    def order_points(pts):
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
 
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
 
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
+        return rect
 
+    rect = order_points(pts)
     (tl, tr, br, bl) = rect
 
     widthA = np.linalg.norm(br - bl)
@@ -64,7 +84,8 @@ def corrige_perspectiva(img):
 
     return warped
 
-def detect_answers_contours(thresh_img, num_questions, num_options, original_img):
+# ------------------ DETECÇÃO AUTOMÁTICA (CONTORNOS) ------------------
+def detect_answers_contours(thresh_img, num_questions, num_options):
     contours, _ = cv2.findContours(thresh_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     answer_contours = []
 
@@ -75,7 +96,6 @@ def detect_answers_contours(thresh_img, num_questions, num_options, original_img
             aspect_ratio = w / float(h)
             if 0.8 <= aspect_ratio <= 1.2:
                 answer_contours.append((x, y, w, h))
-                cv2.rectangle(original_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
     answer_contours = sorted(answer_contours, key=lambda b: (b[1], b[0]))
 
@@ -95,60 +115,67 @@ def detect_answers_contours(thresh_img, num_questions, num_options, original_img
         else:
             respostas.append(None)
 
-    return respostas, original_img
+    return respostas
 
-def detect_answers_ocr(img, num_questions):
-    reader = easyocr.Reader(['pt'], gpu=False)
-    result = reader.readtext(img)
-
-    answers = [None] * num_questions
-    for _, text, _ in result:
-        text = text.strip().lower()
-        if len(text) == 2 and text[0].isdigit() and text[1].isalpha():
-            idx = int(text[0]) - 1
-            answers[idx] = text[1]
+# ------------------ DETECÇÃO POR POSIÇÃO FIXA (MODELO) ------------------
+def detect_answers_fixed(thresh_img, num_questions, num_options):
+    answers = []
+    h, w = thresh_img.shape
+    box_h = h // (num_questions // 5 + 1)
+    box_w = w // 5
+    for q in range(num_questions):
+        row = q // 5
+        col = q % 5
+        x = col * box_w
+        y = row * box_h
+        roi = thresh_img[y:y + box_h, x:x + box_w]
+        roi_h, roi_w = roi.shape
+        opt_w = roi_w // num_options
+        max_fill = 0
+        selected_option = None
+        for i in range(num_options):
+            opt_x = i * opt_w
+            opt_roi = roi[:, opt_x:opt_x + opt_w]
+            fill = cv2.countNonZero(opt_roi)
+            if fill > max_fill:
+                max_fill = fill
+                selected_option = chr(97 + i)
+        answers.append(selected_option)
     return answers
 
-def calcula_acertos(respostas, gabarito):
-    acertos = 0
-    for resp, gab in zip(respostas, gabarito):
-        if resp == gab:
-            acertos += 1
-    return acertos
-
-# ---------- Interface Streamlit ----------
-
-st.title("📝 Leitor de Gabarito")
-st.markdown("Envie uma imagem de um gabarito preenchido para leitura automática.")
-
-uploaded_file = st.file_uploader("Escolha uma imagem", type=["jpg", "jpeg", "png"])
-
-modo = st.selectbox("Modo de leitura", ["Automático (Contornos)", "OCR (Reconhecimento de Texto)"])
-
-num_questions = st.slider("Número de questões", 1, 50, 10)
-num_options = st.slider("Número de alternativas por questão", 2, 5, 4)
-gabarito = st.text_input("Gabarito (ex: abcdabcdab)", max_chars=num_questions).lower()
-
-if uploaded_file is not None and gabarito and len(gabarito) == num_questions:
+# ------------------ PROCESSAMENTO DA IMAGEM ------------------
+if uploaded_file and len(gabarito) == num_questions:
     image = Image.open(uploaded_file)
     img = np.array(image)
-    img = corrige_perspectiva(img)  # Correção de perspectiva
 
-    thresh = preprocess_image(img)
+    with st.spinner("Analisando a imagem..."):
 
-    if modo == "Automático (Contornos)":
-        respostas, contornos_img = detect_answers_contours(thresh, num_questions, num_options, img.copy())
-    else:
-        respostas = detect_answers_ocr(img, num_questions)
-        contornos_img = img  # não altera a imagem
+        if usar_perspectiva:
+            img = corrige_perspectiva(img)
 
-    acertos = calcula_acertos(respostas, list(gabarito))
+        st.subheader("Imagem após correção de perspectiva:")
+        st.image(img, caption="Imagem corrigida", use_column_width=True)
 
-    st.success(f"✅ Acertos: {acertos}/{num_questions}")
-    st.write("Respostas detectadas:", respostas)
+        thresh = preprocess_image(img)
 
-    st.subheader("Imagem corrigida com contornos detectados:")
-    st.image(contornos_img, caption="Círculos detectados", use_column_width=True)
+        if modo == "Automático (Contornos)":
+            respostas = detect_answers_contours(thresh, num_questions, num_options)
+        else:
+            respostas = detect_answers_fixed(thresh, num_questions, num_options)
 
-elif uploaded_file and gabarito and len(gabarito) != num_questions:
-    st.error("❌ O número de caracteres no gabarito não corresponde ao número de questões.")
+        acertos = sum([1 for a, b in zip(respostas, gabarito) if a == b])
+        nota = (acertos / num_questions) * 10
+
+    st.success("Correção finalizada! ✅")
+    st.markdown(f"**Nota final:** {nota:.2f} / 10")
+    st.markdown(f"**Acertos:** {acertos} de {num_questions}")
+
+    st.subheader("Respostas do aluno:")
+    for i, resp in enumerate(respostas, 1):
+        g = gabarito[i - 1].upper()
+        r = resp.upper() if resp else "-"
+        certo = "✅" if resp == gabarito[i - 1] else "❌"
+        st.write(f"Questão {i:02d}: Resposta = {r} | Gabarito = {g} {certo}")
+
+elif uploaded_file and len(gabarito) != num_questions:
+    st.error("O número de respostas no gabarito deve corresponder ao número de questões.")
